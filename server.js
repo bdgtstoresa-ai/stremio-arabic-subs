@@ -1,0 +1,320 @@
+/**
+ * Stremio Arabic Subtitles — Railway/Node.js server
+ * No Cloudflare — Railway IPs are NOT blocked by OpenSubtitles
+ *
+ * Deploy free at railway.app — see README below
+ */
+
+const http = require("http");
+const https = require("https");
+const url = require("url");
+const zlib = require("zlib");
+
+const PORT = process.env.PORT || 3000;
+const OPENSUBS_KEY = process.env.OPENSUBS_KEY || "";
+
+const MANIFEST = {
+  id: "community.arabic.subtitles.v8",
+  version: "8.0.0",
+  name: "🇸🇦 ترجمة عربية تلقائية",
+  description: "Auto-translates English subtitles to Arabic",
+  logo: "https://flagcdn.com/w160/sa.png",
+  resources: ["subtitles"],
+  types: ["movie", "series"],
+  idPrefixes: ["tt"],
+  catalogs: [],
+};
+
+// ── HTTP helpers ─────────────────────────────────────────────────────────────
+
+function fetchUrl(urlStr, options = {}) {
+  return new Promise((resolve, reject) => {
+    const parsed = new url.URL(urlStr);
+    const lib = parsed.protocol === "https:" ? https : http;
+    const req = lib.request(
+      {
+        hostname: parsed.hostname,
+        path: parsed.pathname + parsed.search,
+        method: options.method || "GET",
+        headers: options.headers || {},
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          resolve({ status: res.statusCode, body: Buffer.concat(chunks), headers: res.headers });
+        });
+      }
+    );
+    req.on("error", reject);
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+}
+
+function openSubsHeaders() {
+  return {
+    "Api-Key": OPENSUBS_KEY,
+    "Content-Type": "application/json",
+    "User-Agent": "StremioArabicSubs v8.0.0",
+    "Accept": "application/json",
+  };
+}
+
+// ── OpenSubtitles ─────────────────────────────────────────────────────────────
+
+async function searchOpenSubs(imdbId, season, episode) {
+  if (!OPENSUBS_KEY) throw new Error("OPENSUBS_KEY env var not set");
+
+  const params = new url.URLSearchParams({
+    imdb_id: imdbId.replace("tt", ""),
+    languages: "en",
+    order_by: "download_count",
+  });
+  if (season)  params.set("season_number", season);
+  if (episode) params.set("episode_number", episode);
+
+  const resp = await fetchUrl(
+    `https://api.opensubtitles.com/api/v1/subtitles?${params}`,
+    { headers: openSubsHeaders() }
+  );
+
+  if (resp.status !== 200) {
+    throw new Error(`OpenSubtitles search ${resp.status}: ${resp.body.toString().slice(0, 300)}`);
+  }
+
+  const data = JSON.parse(resp.body.toString());
+  return data.data || [];
+}
+
+async function getDownloadLink(fileId) {
+  const resp = await fetchUrl("https://api.opensubtitles.com/api/v1/download", {
+    method: "POST",
+    headers: openSubsHeaders(),
+    body: JSON.stringify({ file_id: fileId }),
+  });
+
+  if (resp.status !== 200) {
+    throw new Error(`OpenSubtitles download ${resp.status}: ${resp.body.toString().slice(0, 300)}`);
+  }
+
+  const data = JSON.parse(resp.body.toString());
+  if (!data.link) throw new Error("No download link returned");
+  return data.link;
+}
+
+// ── Download & decode SRT ────────────────────────────────────────────────────
+
+async function downloadAndDecode(dlUrl) {
+  const resp = await fetchUrl(dlUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+  if (resp.status !== 200) throw new Error(`Download failed: HTTP ${resp.status}`);
+
+  const buf = resp.body;
+  // Gzip?
+  if (buf[0] === 0x1f && buf[1] === 0x8b) {
+    return new Promise((resolve, reject) => {
+      zlib.gunzip(buf, (err, out) => {
+        if (err) reject(err);
+        else resolve(out.toString("utf8"));
+      });
+    });
+  }
+  return buf.toString("utf8");
+}
+
+// ── SRT parse / build ────────────────────────────────────────────────────────
+
+function parseSRT(content) {
+  const cues = [];
+  const blocks = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split(/\n{2,}/);
+  for (const block of blocks) {
+    const rows = block.trim().split("\n");
+    if (rows.length < 2) continue;
+    if (!/^\d+$/.test(rows[0].trim())) continue;
+    if (!rows[1].includes("-->")) continue;
+    const lines = rows.slice(2).map(l => l.trim().replace(/<[^>]+>/g, "")).filter(Boolean);
+    if (lines.length) cues.push({ id: rows[0].trim(), time: rows[1].trim(), lines });
+  }
+  return cues;
+}
+
+function buildSRT(cues) {
+  return cues.map(c => `${c.id}\n${c.time}\n${c.lines.join("\n")}`).join("\n\n") + "\n";
+}
+
+// ── MS Edge translation ───────────────────────────────────────────────────────
+
+async function msTranslate(texts) {
+  if (!texts.length) return [];
+  const body = JSON.stringify(texts.map(t => ({ Text: t })));
+  const resp = await fetchUrl(
+    "https://api-edge.cognitive.microsoft.com/translate?from=en&to=ar&api-version=3.0",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "User-Agent": "Mozilla/5.0" },
+      body,
+    }
+  );
+  if (resp.status !== 200) throw new Error(`MS translate HTTP ${resp.status}`);
+  const data = JSON.parse(resp.body.toString());
+  return data.map(d => d.translations?.[0]?.text ?? "");
+}
+
+async function translateSRT(srt) {
+  const cues = parseSRT(srt);
+  if (!cues.length) return srt;
+
+  const flat = [], pos = [];
+  for (let ci = 0; ci < cues.length; ci++)
+    for (let li = 0; li < cues[ci].lines.length; li++) {
+      flat.push(cues[ci].lines[li]);
+      pos.push([ci, li]);
+    }
+
+  const CHUNK = 100;
+  const chunks = [];
+  for (let i = 0; i < flat.length; i += CHUNK) chunks.push(flat.slice(i, i + CHUNK));
+  const results = (await Promise.all(chunks.map(msTranslate))).flat();
+
+  const out = cues.map(c => ({ ...c, lines: [...c.lines] }));
+  for (let i = 0; i < pos.length; i++) {
+    const [ci, li] = pos[i];
+    out[ci].lines[li] = results[i] || cues[ci].lines[li];
+  }
+  return buildSRT(out);
+}
+
+// ── Server ────────────────────────────────────────────────────────────────────
+
+const server = http.createServer(async (req, res) => {
+  const parsed = new url.URL(req.url, `http://localhost:${PORT}`);
+  const p = parsed.pathname;
+
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204); res.end(); return;
+  }
+
+  try {
+    // Manifest
+    if (p === "/" || p === "/manifest.json") {
+      res.setHeader("Content-Type", "application/json");
+      res.writeHead(200);
+      res.end(JSON.stringify(MANIFEST));
+      return;
+    }
+
+    // Debug
+    const dbg = p.match(/^\/debug\/(movie|series)\/(.+)$/);
+    if (dbg) {
+      const log = await runDebug(dbg[1], dbg[2], parsed);
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.writeHead(200); res.end(log); return;
+    }
+
+    // Subtitles
+    const sub = p.match(/^\/subtitles\/(movie|series)\/(.+)\.json$/);
+    if (sub) {
+      const result = await handleSubtitles(sub[1], sub[2], parsed);
+      res.setHeader("Content-Type", "application/json");
+      res.writeHead(200);
+      res.end(JSON.stringify(result));
+      return;
+    }
+
+    // Translate
+    if (p === "/translate") {
+      const fileId = parsed.searchParams.get("file_id");
+      if (!fileId) { res.writeHead(400); res.end("Missing file_id"); return; }
+
+      const downloadUrl = await getDownloadLink(Number(fileId));
+      const srtText = await downloadAndDecode(downloadUrl);
+
+      if (!srtText.includes("-->")) {
+        res.writeHead(502); res.end("Not valid SRT"); return;
+      }
+
+      const arabic = await translateSRT(srtText);
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.writeHead(200); res.end(arabic);
+      return;
+    }
+
+    res.writeHead(404); res.end("Not found");
+  } catch (err) {
+    console.error(err.message);
+    res.writeHead(500); res.end(`Error: ${err.message}`);
+  }
+});
+
+async function handleSubtitles(type, id, parsedUrl) {
+  try {
+    const parts = id.split(":");
+    const imdbId = parts[0];
+    const season = parts[1];
+    const episode = parts[2];
+
+    const results = await searchOpenSubs(imdbId, season, episode);
+    if (!results.length) return { subtitles: [] };
+
+    const base = `${parsedUrl.protocol}//${parsedUrl.host}`;
+    const subtitles = results.slice(0, 3).map((r, i) => {
+      const fileId = r.attributes?.files?.[0]?.file_id;
+      if (!fileId) return null;
+      return { id: `ar_${i}`, url: `${base}/translate?file_id=${fileId}`, lang: "ara" };
+    }).filter(Boolean);
+
+    return { subtitles };
+  } catch (err) {
+    console.error("handleSubtitles:", err.message);
+    return { subtitles: [] };
+  }
+}
+
+async function runDebug(type, id, parsedUrl) {
+  const log = [];
+  try {
+    log.push(`OPENSUBS_KEY set: ${OPENSUBS_KEY ? "YES ✅" : "NO ❌"}`);
+
+    const parts = id.split(":");
+    const imdbId = parts[0];
+    const season = parts[1];
+    const episode = parts[2];
+
+    log.push(`\n=== STEP 1: Search OpenSubtitles ===`);
+    const results = await searchOpenSubs(imdbId, season, episode);
+    log.push(`Results: ${results.length}`);
+    if (!results.length) { log.push("❌ No subs found"); return log.join("\n"); }
+
+    const fileId = results[0].attributes?.files?.[0]?.file_id;
+    log.push(`First file_id: ${fileId}`);
+
+    log.push(`\n=== STEP 2: Get download link ===`);
+    const link = await getDownloadLink(fileId);
+    log.push(`Link: ${link}`);
+
+    log.push(`\n=== STEP 3: Download SRT ===`);
+    const srt = await downloadAndDecode(link);
+    log.push(`Length: ${srt.length}, valid: ${srt.includes("-->")}`);
+    log.push(`Preview:\n${srt.slice(0, 300)}`);
+
+    log.push(`\n=== STEP 4: Translation test ===`);
+    const lines = parseSRT(srt).slice(0, 3).flatMap(c => c.lines);
+    const translated = await msTranslate(lines);
+    log.push(`EN: ${JSON.stringify(lines)}`);
+    log.push(`AR: ${JSON.stringify(translated)}`);
+
+    log.push(`\n✅ Everything works!`);
+  } catch (err) {
+    log.push(`\n❌ ERROR: ${err.message}`);
+  }
+  return log.join("\n");
+}
+
+server.listen(PORT, () => {
+  console.log(`✅ Arabic subs server running on port ${PORT}`);
+  console.log(`   Manifest: http://localhost:${PORT}/manifest.json`);
+});

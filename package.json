@@ -1,0 +1,11 @@
+{
+  "name": "stremio-arabic-subs",
+  "version": "8.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
