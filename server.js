@@ -1,8 +1,6 @@
 /**
- * Stremio Arabic Subtitles — Railway/Node.js server
- * No Cloudflare — Railway IPs are NOT blocked by OpenSubtitles
- *
- * Deploy free at railway.app — see README below
+ * Stremio Arabic Subtitles — Railway/Node.js server v9
+ * Fix: fetchUrl now follows HTTP redirects automatically
  */
 
 const http = require("http");
@@ -14,8 +12,8 @@ const PORT = process.env.PORT || 3000;
 const OPENSUBS_KEY = process.env.OPENSUBS_KEY || "";
 
 const MANIFEST = {
-  id: "community.arabic.subtitles.v8",
-  version: "8.0.0",
+  id: "community.arabic.subtitles.v9",
+  version: "9.0.0",
   name: "🇸🇦 ترجمة عربية تلقائية",
   description: "Auto-translates English subtitles to Arabic",
   logo: "https://flagcdn.com/w160/sa.png",
@@ -25,12 +23,15 @@ const MANIFEST = {
   catalogs: [],
 };
 
-// ── HTTP helpers ─────────────────────────────────────────────────────────────
+// ── HTTP helper (follows redirects) ──────────────────────────────────────────
 
-function fetchUrl(urlStr, options = {}) {
+function fetchUrl(urlStr, options = {}, redirectCount = 0) {
   return new Promise((resolve, reject) => {
+    if (redirectCount > 5) return reject(new Error("Too many redirects"));
+
     const parsed = new url.URL(urlStr);
     const lib = parsed.protocol === "https:" ? https : http;
+
     const req = lib.request(
       {
         hostname: parsed.hostname,
@@ -39,10 +40,25 @@ function fetchUrl(urlStr, options = {}) {
         headers: options.headers || {},
       },
       (res) => {
+        // Follow redirects (301, 302, 303, 307, 308)
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+          const redirectUrl = res.headers.location.startsWith("http")
+            ? res.headers.location
+            : `${parsed.protocol}//${parsed.hostname}${res.headers.location}`;
+          // For redirects, use GET and drop body
+          return fetchUrl(redirectUrl, { headers: options.headers }, redirectCount + 1)
+            .then(resolve)
+            .catch(reject);
+        }
+
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
         res.on("end", () => {
-          resolve({ status: res.statusCode, body: Buffer.concat(chunks), headers: res.headers });
+          resolve({
+            status: res.statusCode,
+            body: Buffer.concat(chunks),
+            headers: res.headers,
+          });
         });
       }
     );
@@ -56,7 +72,7 @@ function openSubsHeaders() {
   return {
     "Api-Key": OPENSUBS_KEY,
     "Content-Type": "application/json",
-    "User-Agent": "StremioArabicSubs v8.0.0",
+    "User-Agent": "StremioArabicSubs v9.0.0",
     "Accept": "application/json",
   };
 }
@@ -110,7 +126,6 @@ async function downloadAndDecode(dlUrl) {
   if (resp.status !== 200) throw new Error(`Download failed: HTTP ${resp.status}`);
 
   const buf = resp.body;
-  // Gzip?
   if (buf[0] === 0x1f && buf[1] === 0x8b) {
     return new Promise((resolve, reject) => {
       zlib.gunzip(buf, (err, out) => {
@@ -184,71 +199,7 @@ async function translateSRT(srt) {
   return buildSRT(out);
 }
 
-// ── Server ────────────────────────────────────────────────────────────────────
-
-const server = http.createServer(async (req, res) => {
-  const parsed = new url.URL(req.url, `http://localhost:${PORT}`);
-  const p = parsed.pathname;
-
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-
-  if (req.method === "OPTIONS") {
-    res.writeHead(204); res.end(); return;
-  }
-
-  try {
-    // Manifest
-    if (p === "/" || p === "/manifest.json") {
-      res.setHeader("Content-Type", "application/json");
-      res.writeHead(200);
-      res.end(JSON.stringify(MANIFEST));
-      return;
-    }
-
-    // Debug
-    const dbg = p.match(/^\/debug\/(movie|series)\/(.+)$/);
-    if (dbg) {
-      const log = await runDebug(dbg[1], dbg[2], parsed);
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.writeHead(200); res.end(log); return;
-    }
-
-    // Subtitles
-    const sub = p.match(/^\/subtitles\/(movie|series)\/(.+)\.json$/);
-    if (sub) {
-      const result = await handleSubtitles(sub[1], sub[2], parsed);
-      res.setHeader("Content-Type", "application/json");
-      res.writeHead(200);
-      res.end(JSON.stringify(result));
-      return;
-    }
-
-    // Translate
-    if (p === "/translate") {
-      const fileId = parsed.searchParams.get("file_id");
-      if (!fileId) { res.writeHead(400); res.end("Missing file_id"); return; }
-
-      const downloadUrl = await getDownloadLink(Number(fileId));
-      const srtText = await downloadAndDecode(downloadUrl);
-
-      if (!srtText.includes("-->")) {
-        res.writeHead(502); res.end("Not valid SRT"); return;
-      }
-
-      const arabic = await translateSRT(srtText);
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.setHeader("Cache-Control", "public, max-age=86400");
-      res.writeHead(200); res.end(arabic);
-      return;
-    }
-
-    res.writeHead(404); res.end("Not found");
-  } catch (err) {
-    console.error(err.message);
-    res.writeHead(500); res.end(`Error: ${err.message}`);
-  }
-});
+// ── Route handlers ────────────────────────────────────────────────────────────
 
 async function handleSubtitles(type, id, parsedUrl) {
   try {
@@ -274,7 +225,7 @@ async function handleSubtitles(type, id, parsedUrl) {
   }
 }
 
-async function runDebug(type, id, parsedUrl) {
+async function runDebug(type, id) {
   const log = [];
   try {
     log.push(`OPENSUBS_KEY set: ${OPENSUBS_KEY ? "YES ✅" : "NO ❌"}`);
@@ -294,11 +245,11 @@ async function runDebug(type, id, parsedUrl) {
 
     log.push(`\n=== STEP 2: Get download link ===`);
     const link = await getDownloadLink(fileId);
-    log.push(`Link: ${link}`);
+    log.push(`Link obtained ✅`);
 
     log.push(`\n=== STEP 3: Download SRT ===`);
     const srt = await downloadAndDecode(link);
-    log.push(`Length: ${srt.length}, valid: ${srt.includes("-->")}`);
+    log.push(`Length: ${srt.length} chars, valid: ${srt.includes("-->")}`);
     log.push(`Preview:\n${srt.slice(0, 300)}`);
 
     log.push(`\n=== STEP 4: Translation test ===`);
@@ -307,14 +258,74 @@ async function runDebug(type, id, parsedUrl) {
     log.push(`EN: ${JSON.stringify(lines)}`);
     log.push(`AR: ${JSON.stringify(translated)}`);
 
-    log.push(`\n✅ Everything works!`);
+    log.push(`\n✅ Everything works! Install in Stremio:`);
+    log.push(`https://stremio-arabic-subs-production-59d3.up.railway.app/manifest.json`);
   } catch (err) {
     log.push(`\n❌ ERROR: ${err.message}`);
   }
   return log.join("\n");
 }
 
+// ── Server ────────────────────────────────────────────────────────────────────
+
+const server = http.createServer(async (req, res) => {
+  const parsed = new url.URL(req.url, `http://localhost:${PORT}`);
+  const p = parsed.pathname;
+
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+
+  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+
+  try {
+    if (p === "/" || p === "/manifest.json") {
+      res.setHeader("Content-Type", "application/json");
+      res.writeHead(200);
+      res.end(JSON.stringify(MANIFEST));
+      return;
+    }
+
+    const dbg = p.match(/^\/debug\/(movie|series)\/(.+)$/);
+    if (dbg) {
+      const log = await runDebug(dbg[1], dbg[2]);
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.writeHead(200); res.end(log); return;
+    }
+
+    const sub = p.match(/^\/subtitles\/(movie|series)\/(.+)\.json$/);
+    if (sub) {
+      const result = await handleSubtitles(sub[1], sub[2], parsed);
+      res.setHeader("Content-Type", "application/json");
+      res.writeHead(200);
+      res.end(JSON.stringify(result));
+      return;
+    }
+
+    if (p === "/translate") {
+      const fileId = parsed.searchParams.get("file_id");
+      if (!fileId) { res.writeHead(400); res.end("Missing file_id"); return; }
+
+      const downloadUrl = await getDownloadLink(Number(fileId));
+      const srtText = await downloadAndDecode(downloadUrl);
+
+      if (!srtText.includes("-->")) {
+        res.writeHead(502); res.end("Not valid SRT"); return;
+      }
+
+      const arabic = await translateSRT(srtText);
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.writeHead(200); res.end(arabic);
+      return;
+    }
+
+    res.writeHead(404); res.end("Not found");
+  } catch (err) {
+    console.error(err.message);
+    res.writeHead(500); res.end(`Error: ${err.message}`);
+  }
+});
+
 server.listen(PORT, () => {
-  console.log(`✅ Arabic subs server running on port ${PORT}`);
-  console.log(`   Manifest: http://localhost:${PORT}/manifest.json`);
+  console.log(`✅ Server running on port ${PORT}`);
 });
