@@ -7,16 +7,20 @@ const PORT = process.env.PORT || 3000;
 const OPENSUBS_KEY = process.env.OPENSUBS_KEY || "";
 
 const MANIFEST = {
-  id: "community.arabic.subtitles.v10",
-  version: "10.0.0",
+  id: "community.arabic.subtitles.v11",
+  version: "11.0.0",
   name: "🇸🇦 ترجمة عربية تلقائية",
-  description: "Auto-translates English subtitles to Arabic",
+  description: "Translates subtitles from ANY language to Arabic",
   logo: "https://flagcdn.com/w160/sa.png",
   resources: ["subtitles"],
   types: ["movie", "series"],
   idPrefixes: ["tt"],
   catalogs: [],
 };
+
+// Languages to search (in priority order — best translation quality first)
+// English is best, then major European languages MS Edge translates well
+const SEARCH_LANGS = ["en", "fr", "it", "es", "pt", "de", "pl", "ro", "nl"];
 
 function fetchUrl(urlStr, options = {}, redirectCount = 0) {
   return new Promise((resolve, reject) => {
@@ -45,7 +49,7 @@ function openSubsHeaders() {
   return {
     "Api-Key": OPENSUBS_KEY,
     "Content-Type": "application/json",
-    "User-Agent": "StremioArabicSubs v10.0.0",
+    "User-Agent": "StremioArabicSubs v11.0.0",
     "Accept": "application/json",
   };
 }
@@ -55,27 +59,39 @@ async function openSubsRequest(params) {
     `https://api.opensubtitles.com/api/v1/subtitles?${params}`,
     { headers: openSubsHeaders() }
   );
-  if (resp.status !== 200) throw new Error(`OpenSubtitles ${resp.status}: ${resp.body.toString().slice(0, 300)}`);
+  if (resp.status !== 200) throw new Error(`OpenSubtitles ${resp.status}: ${resp.body.toString().slice(0, 200)}`);
   const data = JSON.parse(resp.body.toString());
   return data.data || [];
 }
 
+// Search for subtitles in multiple languages, return first match found
 async function searchOpenSubs(imdbId, season, episode) {
   if (!OPENSUBS_KEY) throw new Error("OPENSUBS_KEY not set");
 
-  const base = { imdb_id: imdbId.replace("tt", ""), languages: "en", order_by: "download_count" };
+  const cleanId = imdbId.replace("tt", "");
 
-  // Try 1: exact season + episode
-  if (season && episode) {
-    const r = await openSubsRequest(new url.URLSearchParams({ ...base, season_number: season, episode_number: episode }));
-    if (r.length) { console.log(`Found ${r.length} subs with season/ep filter`); return r; }
-    console.log("No results with season/ep, trying without...");
+  // Try each language in order, with and without season/episode
+  for (const lang of SEARCH_LANGS) {
+    const base = { imdb_id: cleanId, languages: lang, order_by: "download_count" };
+
+    // With season+episode first
+    if (season && episode) {
+      const r = await openSubsRequest(new url.URLSearchParams({ ...base, season_number: season, episode_number: episode }));
+      if (r.length) {
+        console.log(`Found ${r.length} subs in [${lang}] with season/ep`);
+        return { results: r, lang };
+      }
+    }
+
+    // Without season+episode (fallback for shows with different numbering)
+    const r2 = await openSubsRequest(new url.URLSearchParams(base));
+    if (r2.length) {
+      console.log(`Found ${r2.length} subs in [${lang}] without season/ep`);
+      return { results: r2, lang };
+    }
   }
 
-  // Try 2: just imdb_id (show has different numbering on OpenSubtitles)
-  const r2 = await openSubsRequest(new url.URLSearchParams(base));
-  console.log(`Found ${r2.length} subs without season/ep filter`);
-  return r2;
+  return { results: [], lang: null };
 }
 
 async function getDownloadLink(fileId) {
@@ -84,7 +100,7 @@ async function getDownloadLink(fileId) {
     headers: openSubsHeaders(),
     body: JSON.stringify({ file_id: fileId }),
   });
-  if (resp.status !== 200) throw new Error(`Download link ${resp.status}: ${resp.body.toString().slice(0, 300)}`);
+  if (resp.status !== 200) throw new Error(`Download link ${resp.status}: ${resp.body.toString().slice(0, 200)}`);
   const data = JSON.parse(resp.body.toString());
   if (!data.link) throw new Error("No download link returned");
   return data.link;
@@ -95,7 +111,7 @@ async function downloadAndDecode(dlUrl) {
   if (resp.status !== 200) throw new Error(`Download failed: HTTP ${resp.status}`);
   const buf = resp.body;
   if (buf[0] === 0x1f && buf[1] === 0x8b) {
-    return new Promise((resolve, reject) => zlib.gunzip(buf, (err, out) => err ? reject(err) : resolve(out.toString("utf8"))));
+    return new Promise((res, rej) => zlib.gunzip(buf, (e, o) => e ? rej(e) : res(o.toString("utf8"))));
   }
   return buf.toString("utf8");
 }
@@ -118,13 +134,19 @@ function buildSRT(cues) {
   return cues.map(c => `${c.id}\n${c.time}\n${c.lines.join("\n")}`).join("\n\n") + "\n";
 }
 
+// MS Edge translation — auto-detects source language, translates to Arabic
 async function msTranslate(texts) {
   if (!texts.length) return [];
   const resp = await fetchUrl(
-    "https://api-edge.cognitive.microsoft.com/translate?from=en&to=ar&api-version=3.0",
-    { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "Mozilla/5.0" }, body: JSON.stringify(texts.map(t => ({ Text: t }))) }
+    // No "from" param = auto-detect source language
+    "https://api-edge.cognitive.microsoft.com/translate?to=ar&api-version=3.0",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "User-Agent": "Mozilla/5.0" },
+      body: JSON.stringify(texts.map(t => ({ Text: t }))),
+    }
   );
-  if (resp.status !== 200) throw new Error(`MS translate HTTP ${resp.status}`);
+  if (resp.status !== 200) throw new Error(`MS translate HTTP ${resp.status}: ${resp.body.toString().slice(0,200)}`);
   return JSON.parse(resp.body.toString()).map(d => d.translations?.[0]?.text ?? "");
 }
 
@@ -146,7 +168,7 @@ async function translateSRT(srt) {
 async function handleSubtitles(type, id, parsedUrl) {
   try {
     const parts = id.split(":");
-    const results = await searchOpenSubs(parts[0], parts[1], parts[2]);
+    const { results } = await searchOpenSubs(parts[0], parts[1], parts[2]);
     if (!results.length) return { subtitles: [] };
     const base = `${parsedUrl.protocol}//${parsedUrl.host}`;
     const subtitles = results.slice(0, 3).map((r, i) => {
@@ -165,31 +187,31 @@ async function runDebug(type, id) {
   try {
     log.push(`OPENSUBS_KEY: ${OPENSUBS_KEY ? "YES ✅" : "NO ❌"}`);
     const parts = id.split(":");
-    const imdbId = parts[0], season = parts[1], episode = parts[2];
-    log.push(`IMDb: ${imdbId}, Season: ${season}, Episode: ${episode}`);
+    log.push(`IMDb: ${parts[0]}, Season: ${parts[1]}, Episode: ${parts[2]}`);
+    log.push(`Searching in: ${SEARCH_LANGS.join(", ")}`);
 
-    log.push(`\n=== STEP 1: Search (with season/ep fallback) ===`);
-    const results = await searchOpenSubs(imdbId, season, episode);
-    log.push(`Total results: ${results.length}`);
-    if (!results.length) { log.push("❌ No subs found on OpenSubtitles for this show"); return log.join("\n"); }
+    log.push(`\n=== STEP 1: Find subtitles ===`);
+    const { results, lang } = await searchOpenSubs(parts[0], parts[1], parts[2]);
+    log.push(`Found: ${results.length} results in language: [${lang || "none"}]`);
+    if (!results.length) { log.push("❌ No subtitles found in any language"); return log.join("\n"); }
 
     const fileId = results[0].attributes?.files?.[0]?.file_id;
     log.push(`First result: "${results[0].attributes?.release}" (file_id: ${fileId})`);
 
-    log.push(`\n=== STEP 2: Get download link ===`);
+    log.push(`\n=== STEP 2: Download ===`);
     const link = await getDownloadLink(fileId);
     log.push(`Link obtained ✅`);
 
-    log.push(`\n=== STEP 3: Download SRT ===`);
+    log.push(`\n=== STEP 3: Read SRT ===`);
     const srt = await downloadAndDecode(link);
     log.push(`Length: ${srt.length} chars, valid: ${srt.includes("-->")}`);
     log.push(`Preview:\n${srt.slice(0, 300)}`);
 
-    log.push(`\n=== STEP 4: Translation test ===`);
+    log.push(`\n=== STEP 4: Translate to Arabic ===`);
     const lines = parseSRT(srt).slice(0, 3).flatMap(c => c.lines);
     const translated = await msTranslate(lines);
-    log.push(`EN: ${JSON.stringify(lines)}`);
-    log.push(`AR: ${JSON.stringify(translated)}`);
+    log.push(`Source: ${JSON.stringify(lines)}`);
+    log.push(`Arabic: ${JSON.stringify(translated)}`);
 
     log.push(`\n✅ Works! Install in Stremio:\nhttps://stremio-arabic-subs-production-59d3.up.railway.app/manifest.json`);
   } catch (err) {
@@ -210,10 +232,8 @@ const server = http.createServer(async (req, res) => {
     }
     const dbg = p.match(/^\/debug\/(movie|series)\/(.+)$/);
     if (dbg) { const log = await runDebug(dbg[1], dbg[2]); res.setHeader("Content-Type", "text/plain; charset=utf-8"); res.writeHead(200); res.end(log); return; }
-
     const sub = p.match(/^\/subtitles\/(movie|series)\/(.+)\.json$/);
     if (sub) { const r = await handleSubtitles(sub[1], sub[2], parsed); res.setHeader("Content-Type", "application/json"); res.writeHead(200); res.end(JSON.stringify(r)); return; }
-
     if (p === "/translate") {
       const fileId = parsed.searchParams.get("file_id");
       if (!fileId) { res.writeHead(400); res.end("Missing file_id"); return; }
@@ -225,7 +245,6 @@ const server = http.createServer(async (req, res) => {
       res.setHeader("Cache-Control", "public, max-age=86400");
       res.writeHead(200); res.end(arabic); return;
     }
-
     res.writeHead(404); res.end("Not found");
   } catch (err) {
     console.error(err.message);
